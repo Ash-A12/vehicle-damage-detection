@@ -1,77 +1,68 @@
 import cv2 as cv
 import numpy as np
 
-# Read image
+# 1. Load and Isolate
 img = cv.imread("photos/car14.jpeg")
-cv.imshow("Original", img)
+if img is None:
+    print("Error: Image not found.")
+    exit()
 
-# Create mask
+# Create mask for GrabCut
 mask = np.zeros(img.shape[:2], np.uint8)
+bgModel = np.zeros((1, 65), np.float64)
+fgModel = np.zeros((1, 65), np.float64)
 
-# Models used internally by GrabCut
-bgModel = np.zeros((1,65), np.float64)
-fgModel = np.zeros((1,65), np.float64)
+# Keep the rectangle slightly away from the extreme edges to avoid border noise
+rect = (15, 15, img.shape[1]-30, img.shape[0]-30)
+cv.grabCut(img, mask, rect, bgModel, fgModel, 5, cv.GC_INIT_WITH_RECT)
 
-# Rectangle around the object
-rect = (10, 10, img.shape[1]-20, img.shape[0]-20)
+# Create a binary mask where 1 and 3 are foreground
+mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+car_only = img * mask2[:, :, np.newaxis]
 
-# Apply GrabCut
-cv.grabCut(img, mask, rect, bgModel, fgModel, 10, cv.GC_INIT_WITH_RECT)
+# 2. Pre-processing for Dents
+gray = cv.cvtColor(car_only, cv.COLOR_BGR2GRAY)
 
-# Convert mask to binary
-mask2 = np.where((mask==2)|(mask==0), 0, 1).astype('uint8')
+# Apply CLAHE to equalize light (dents are often hidden in shadows/glare)
+clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+enhanced_gray = clahe.apply(gray)
 
-# Extract car
-car = img * mask2[:,:,np.newaxis]
+# 3. Morphological Filtering
+# We use Black-Hat to find dark deformations (dents) against the paint
+# Use a larger kernel to capture the scale of a dent vs a tiny scratch
+kernel_dent = cv.getStructuringElement(cv.MORPH_ELLIPSE, (15, 15))
+blackhat = cv.morphologyEx(enhanced_gray, cv.MORPH_BLACKHAT, kernel_dent)
 
-# Combine
-#result = np.where(mask2[:,:,None]==1, img, blur)
+# Threshold the result to get distinct blobs
+_, thresh = cv.threshold(blackhat, 15, 255, cv.THRESH_BINARY)
 
-cv.imshow("Segmented Car", car)
-#cv.imshow("Blurred Background", result)
+# 4. Clean up Noise
+# Remove very small specs and join nearby damaged areas
+kernel_clean = np.ones((5, 5), np.uint8)
+cleaned = cv.morphologyEx(thresh, cv.MORPH_OPEN, kernel_clean)
+dilated = cv.dilate(cleaned, kernel_clean, iterations=2)
 
-# Convert to grayscale
-gray = cv.cvtColor(car, cv.COLOR_BGR2GRAY)
-
-# Scratch enhancement
-kernel = np.ones((3,3),np.uint8)
-tophat = cv.morphologyEx(gray, cv.MORPH_TOPHAT, kernel)
-
-cv.imshow("Scratch Enhancement", tophat)
-
-# Blur background
-#blur = cv.GaussianBlur(img,(25,25),0)
-
-#smooth the tophat image
-tophat_blur= cv.GaussianBlur(tophat,(3,3),0)
-#Edge detection(fixed)
-edges =cv.Canny(tophat_blur,20,80)
-
-
-# Edge detection
-#blur_gray = cv.GaussianBlur(gray,(9,9),0)
-#edges = cv.Canny(blur_gray,100,200)
-#edges=cv.Canny(tophat,20,80)
-
-#Thicken edges
-kernel = np.ones((3,3), np.uint8)
-edges = cv.dilate(edges, kernel, iterations=2)
-
-cv.imshow("Edges", edges)
-
-# Detect dents
-contours,_ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-damage = img.copy()
+# 5. Intelligent Contour Filtering
+contours, _ = cv.findContours(dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+output = img.copy()
 
 for cnt in contours:
     area = cv.contourArea(cnt)
+    if area > 150:  # Filter out tiny noise
+        x, y, w, h = cv.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+        
+        # LOGIC: Dents are usually somewhat "boxy" or "round". 
+        # Door seams/scratches are very thin (very high or low aspect ratio).
+        if 0.2 < aspect_ratio < 5.0:
+            cv.rectangle(output, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv.putText(output, "Potential Dent", (x, y - 10), 
+                       cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    if area > 50:
-        x,y,w,h = cv.boundingRect(cnt)
-        cv.rectangle(damage,(x,y),(x+w,y+h),(0,0,255),2)
-
-cv.imshow("Possible Damage", damage)
+# Display Results
+cv.imshow("Enhanced Gray (CLAHE)", enhanced_gray)
+cv.imshow("BlackHat Transform", blackhat)
+cv.imshow("Detected Damage", output)
 
 cv.waitKey(0)
 cv.destroyAllWindows()
